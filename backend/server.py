@@ -1,0 +1,874 @@
+import os
+from dotenv import load_dotenv
+from pathlib import Path
+
+ROOT_DIR = Path(__file__).parent
+load_dotenv(ROOT_DIR / '.env')
+
+import logging
+import random
+import secrets
+from datetime import datetime, timezone, timedelta
+from typing import List, Optional, Annotated
+
+import bcrypt
+import jwt
+from bson import ObjectId
+from fastapi import FastAPI, APIRouter, HTTPException, Depends, Request, Response, WebSocket, WebSocketDisconnect
+from starlette.middleware.cors import CORSMiddleware
+from motor.motor_asyncio import AsyncIOMotorClient
+from pydantic import BaseModel, Field, EmailStr, BeforeValidator, ConfigDict
+
+# ----------------------------------------------------------------------------
+# DB
+# ----------------------------------------------------------------------------
+mongo_url = os.environ['MONGO_URL']
+client = AsyncIOMotorClient(mongo_url)
+db = client[os.environ['DB_NAME']]
+
+app = FastAPI(title="Vortex Cloud Gaming API")
+api_router = APIRouter(prefix="/api")
+
+JWT_ALGORITHM = "HS256"
+logger = logging.getLogger("vortex")
+logging.basicConfig(level=logging.INFO)
+
+PyObjectId = Annotated[str, BeforeValidator(str)]
+
+
+# ----------------------------------------------------------------------------
+# Auth helpers
+# ----------------------------------------------------------------------------
+def hash_password(password: str) -> str:
+    return bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
+
+
+def verify_password(plain: str, hashed: str) -> bool:
+    try:
+        return bcrypt.checkpw(plain.encode("utf-8"), hashed.encode("utf-8"))
+    except Exception:
+        return False
+
+
+def get_jwt_secret() -> str:
+    return os.environ["JWT_SECRET"]
+
+
+def create_access_token(user_id: str, email: str) -> str:
+    payload = {"sub": user_id, "email": email,
+               "exp": datetime.now(timezone.utc) + timedelta(days=7), "type": "access"}
+    return jwt.encode(payload, get_jwt_secret(), algorithm=JWT_ALGORITHM)
+
+
+async def get_current_user(request: Request) -> dict:
+    token = request.cookies.get("access_token")
+    if not token:
+        auth_header = request.headers.get("Authorization", "")
+        if auth_header.startswith("Bearer "):
+            token = auth_header[7:]
+    if not token:
+        raise HTTPException(status_code=401, detail="Não autenticado")
+    try:
+        payload = jwt.decode(token, get_jwt_secret(), algorithms=[JWT_ALGORITHM])
+        if payload.get("type") != "access":
+            raise HTTPException(status_code=401, detail="Token inválido")
+        user = await db.users.find_one({"_id": ObjectId(payload["sub"])})
+        if not user:
+            raise HTTPException(status_code=401, detail="Usuário não encontrado")
+        user["_id"] = str(user["_id"])
+        user.pop("password_hash", None)
+        return user
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(status_code=401, detail="Sessão expirada")
+    except jwt.InvalidTokenError:
+        raise HTTPException(status_code=401, detail="Token inválido")
+
+
+# ----------------------------------------------------------------------------
+# Models
+# ----------------------------------------------------------------------------
+class RegisterInput(BaseModel):
+    name: str
+    email: EmailStr
+    password: str
+
+
+class LoginInput(BaseModel):
+    email: EmailStr
+    password: str
+
+
+class StartSessionInput(BaseModel):
+    game_id: str
+    node_id: str
+
+
+class CreateSaveInput(BaseModel):
+    game_id: str
+    label: Optional[str] = None
+    session_id: Optional[str] = None
+
+
+# ----------------------------------------------------------------------------
+# Seed data
+# ----------------------------------------------------------------------------
+NODES_SEED = [
+    {"id": "sao-paulo", "name": "São Paulo", "country": "Brasil", "flag": "🇧🇷", "gpu": "RTX 4090",
+     "base_ping": 12, "region": "América do Sul"},
+    {"id": "virginia", "name": "Virgínia", "country": "EUA", "flag": "🇺🇸", "gpu": "RTX 4090",
+     "base_ping": 128, "region": "América do Norte"},
+    {"id": "frankfurt", "name": "Frankfurt", "country": "Alemanha", "flag": "🇩🇪", "gpu": "RTX 4080",
+     "base_ping": 210, "region": "Europa"},
+    {"id": "tokyo", "name": "Tóquio", "country": "Japão", "flag": "🇯🇵", "gpu": "RTX 4090",
+     "base_ping": 265, "region": "Ásia"},
+    {"id": "santiago", "name": "Santiago", "country": "Chile", "flag": "🇨🇱", "gpu": "RTX 4070 Ti",
+     "base_ping": 38, "region": "América do Sul"},
+]
+
+
+# ----------------------------------------------------------------------------
+# Auth endpoints
+# ----------------------------------------------------------------------------
+def _public_user(doc: dict) -> dict:
+    return {"id": str(doc["_id"]), "name": doc.get("name"), "email": doc.get("email"),
+            "role": doc.get("role", "user"), "plan": doc.get("plan", "Free Trial"),
+            "created_at": doc.get("created_at")}
+
+
+def _set_cookie(response: Response, token: str):
+    response.set_cookie(key="access_token", value=token, httponly=True, secure=True,
+                        samesite="none", max_age=604800, path="/")
+
+
+@api_router.post("/auth/register")
+async def register(payload: RegisterInput, response: Response):
+    email = payload.email.lower()
+    if await db.users.find_one({"email": email}):
+        raise HTTPException(status_code=400, detail="Este e-mail já está cadastrado")
+    doc = {"name": payload.name, "email": email, "password_hash": hash_password(payload.password),
+           "role": "user", "plan": "Free Trial", "created_at": datetime.now(timezone.utc).isoformat()}
+    res = await db.users.insert_one(doc)
+    doc["_id"] = res.inserted_id
+    token = create_access_token(str(res.inserted_id), email)
+    _set_cookie(response, token)
+    return {"user": _public_user(doc), "token": token}
+
+
+@api_router.post("/auth/login")
+async def login(payload: LoginInput, response: Response):
+    email = payload.email.lower()
+    user = await db.users.find_one({"email": email})
+    if not user or not verify_password(payload.password, user["password_hash"]):
+        raise HTTPException(status_code=401, detail="E-mail ou senha inválidos")
+    token = create_access_token(str(user["_id"]), email)
+    _set_cookie(response, token)
+    return {"user": _public_user(user), "token": token}
+
+
+@api_router.post("/auth/logout")
+async def logout(response: Response):
+    response.delete_cookie("access_token", path="/")
+    return {"ok": True}
+
+
+@api_router.get("/auth/me")
+async def me(user: dict = Depends(get_current_user)):
+    return {"user": {"id": user["_id"], "name": user.get("name"), "email": user.get("email"),
+                     "role": user.get("role", "user"), "plan": user.get("plan", "Free Trial"),
+                     "created_at": user.get("created_at")}}
+
+
+# ----------------------------------------------------------------------------
+# Games
+# ----------------------------------------------------------------------------
+@api_router.get("/games")
+async def list_games():
+    return await db.mygames.find({"cover": {"$ne": ""}}, {"_id": 0, "id": 1, "title": 1, "cover": 1}).to_list(50)
+
+
+@api_router.get("/games/{game_id}")
+async def get_game(game_id: str):
+    game = await db.games.find_one({"id": game_id}, {"_id": 0})
+    if not game:
+        raise HTTPException(status_code=404, detail="Jogo não encontrado")
+    return game
+
+
+# ----------------------------------------------------------------------------
+# Nodes (with dynamic live-ish metrics)
+# ----------------------------------------------------------------------------
+@api_router.get("/nodes")
+async def list_nodes():
+    nodes = await db.nodes.find({}, {"_id": 0}).to_list(1000)
+    out = []
+    for n in nodes:
+        jitter = random.randint(-4, 6)
+        load = random.randint(35, 92)
+        queue = 0 if load < 85 else random.randint(1, 4)
+        out.append({**n, "ping": max(5, n["base_ping"] + jitter), "load": load,
+                    "gpu_util": random.randint(40, 98), "queue": queue,
+                    "status": "online" if load < 97 else "degraded"})
+    return out
+
+
+# ----------------------------------------------------------------------------
+# Library
+# ----------------------------------------------------------------------------
+@api_router.get("/library")
+async def get_library(user: dict = Depends(get_current_user)):
+    items = await db.library.find({"user_id": user["_id"]}, {"_id": 0}).to_list(1000)
+    games_by_id = {g["id"]: g for g in await db.games.find({}, {"_id": 0}).to_list(1000)}
+    result = []
+    for it in items:
+        g = games_by_id.get(it["game_id"])
+        if g:
+            result.append({**g, "hours_played": it.get("hours_played", 0),
+                           "favorite": it.get("favorite", False),
+                           "added_at": it.get("added_at"),
+                           "last_played": it.get("last_played")})
+    return result
+
+
+@api_router.post("/library/{game_id}")
+async def add_to_library(game_id: str, user: dict = Depends(get_current_user)):
+    game = await db.games.find_one({"id": game_id})
+    if not game:
+        raise HTTPException(status_code=404, detail="Jogo não encontrado")
+    existing = await db.library.find_one({"user_id": user["_id"], "game_id": game_id})
+    if existing:
+        return {"ok": True, "already": True}
+    await db.library.insert_one({"user_id": user["_id"], "game_id": game_id,
+                                 "hours_played": 0, "favorite": False,
+                                 "added_at": datetime.now(timezone.utc).isoformat()})
+    return {"ok": True}
+
+
+@api_router.delete("/library/{game_id}")
+async def remove_from_library(game_id: str, user: dict = Depends(get_current_user)):
+    await db.library.delete_one({"user_id": user["_id"], "game_id": game_id})
+    return {"ok": True}
+
+
+@api_router.post("/library/{game_id}/favorite")
+async def toggle_favorite(game_id: str, user: dict = Depends(get_current_user)):
+    item = await db.library.find_one({"user_id": user["_id"], "game_id": game_id})
+    if not item:
+        raise HTTPException(status_code=404, detail="Jogo não está na biblioteca")
+    new_val = not item.get("favorite", False)
+    await db.library.update_one({"_id": item["_id"]}, {"$set": {"favorite": new_val}})
+    return {"ok": True, "favorite": new_val}
+
+
+# ----------------------------------------------------------------------------
+# Sessions
+# ----------------------------------------------------------------------------
+@api_router.post("/sessions/start")
+async def start_session(payload: StartSessionInput, user: dict = Depends(get_current_user)):
+    game = await db.games.find_one({"id": payload.game_id}, {"_id": 0})
+    node = await db.nodes.find_one({"id": payload.node_id}, {"_id": 0})
+    if not game or not node:
+        raise HTTPException(status_code=404, detail="Jogo ou servidor inválido")
+    # auto-add to library
+    if not await db.library.find_one({"user_id": user["_id"], "game_id": payload.game_id}):
+        await db.library.insert_one({"user_id": user["_id"], "game_id": payload.game_id,
+                                     "hours_played": 0, "favorite": False,
+                                     "added_at": datetime.now(timezone.utc).isoformat()})
+    # end previous active sessions
+    await db.sessions.update_many({"user_id": user["_id"], "active": True},
+                                  {"$set": {"active": False, "ended_at": datetime.now(timezone.utc).isoformat()}})
+    sess_id = secrets.token_hex(8)
+    queue = node.get("base_ping", 0) and random.choice([0, 0, 0, 1])
+    doc = {"id": sess_id, "user_id": user["_id"], "game_id": payload.game_id,
+           "node_id": payload.node_id, "active": True, "queue_position": queue,
+           "started_at": datetime.now(timezone.utc).isoformat()}
+    await db.sessions.insert_one(doc)
+    await db.library.update_one({"user_id": user["_id"], "game_id": payload.game_id},
+                                {"$set": {"last_played": datetime.now(timezone.utc).isoformat()}})
+    return {"session": {k: v for k, v in doc.items() if k != "_id"}, "game": game, "node": node}
+
+
+@api_router.get("/sessions/active")
+async def active_session(user: dict = Depends(get_current_user)):
+    doc = await db.sessions.find_one({"user_id": user["_id"], "active": True}, {"_id": 0})
+    if not doc:
+        return {"session": None}
+    game = await db.games.find_one({"id": doc["game_id"]}, {"_id": 0})
+    node = await db.nodes.find_one({"id": doc["node_id"]}, {"_id": 0})
+    return {"session": doc, "game": game, "node": node}
+
+
+@api_router.get("/sessions/{session_id}/metrics")
+async def session_metrics(session_id: str, user: dict = Depends(get_current_user)):
+    doc = await db.sessions.find_one({"id": session_id, "user_id": user["_id"]}, {"_id": 0})
+    if not doc:
+        raise HTTPException(status_code=404, detail="Sessão não encontrada")
+    node = await db.nodes.find_one({"id": doc["node_id"]}, {"_id": 0})
+    base = node.get("base_ping", 20) if node else 20
+    fps = random.choice([60, 90, 120, 120, 120, 118, 116])
+    return {"fps": fps, "ping": max(5, base + random.randint(-3, 8)),
+            "bitrate": random.randint(38, 55), "resolution": "4K HDR",
+            "packet_loss": round(random.uniform(0, 0.4), 2),
+            "codec": random.choice(["AV1", "H.265"])}
+
+
+@api_router.post("/sessions/{session_id}/end")
+async def end_session(session_id: str, user: dict = Depends(get_current_user)):
+    doc = await db.sessions.find_one({"id": session_id, "user_id": user["_id"]})
+    if doc:
+        await db.sessions.update_one({"_id": doc["_id"]},
+                                     {"$set": {"active": False, "ended_at": datetime.now(timezone.utc).isoformat()}})
+        # accrue some play time
+        started = datetime.fromisoformat(doc["started_at"])
+        mins = (datetime.now(timezone.utc) - started).total_seconds() / 3600
+        await db.library.update_one({"user_id": user["_id"], "game_id": doc["game_id"]},
+                                    {"$inc": {"hours_played": round(mins, 2)}})
+    return {"ok": True}
+
+
+@api_router.get("/sessions/history")
+async def sessions_history(user: dict = Depends(get_current_user)):
+    docs = await db.sessions.find({"user_id": user["_id"]}, {"_id": 0}).sort("started_at", -1).to_list(500)
+    games_by_id = {g["id"]: g for g in await db.games.find({}, {"_id": 0}).to_list(1000)}
+    nodes_by_id = {n["id"]: n for n in await db.nodes.find({}, {"_id": 0}).to_list(1000)}
+    out = []
+    for d in docs:
+        g = games_by_id.get(d["game_id"])
+        n = nodes_by_id.get(d["node_id"])
+        start = datetime.fromisoformat(d["started_at"])
+        end = datetime.fromisoformat(d["ended_at"]) if d.get("ended_at") else datetime.now(timezone.utc)
+        duration = int((end - start).total_seconds())
+        saves = await db.saves.find({"user_id": user["_id"], "session_id": d["id"]}, {"_id": 0}).to_list(100)
+        out.append({
+            "id": d["id"],
+            "active": d.get("active", False),
+            "started_at": d["started_at"],
+            "ended_at": d.get("ended_at"),
+            "duration_seconds": duration,
+            "game": {"id": g["id"], "title": g["title"], "cover": g["cover"]} if g else None,
+            "node": {"id": n["id"], "name": n["name"], "flag": n["flag"], "gpu": n["gpu"]} if n else None,
+            "saves": [{"id": s["id"], "label": s["label"]} for s in saves],
+        })
+    return out
+
+
+# ----------------------------------------------------------------------------
+# Cloud Saves
+# ----------------------------------------------------------------------------
+@api_router.get("/saves")
+async def list_saves(game_id: Optional[str] = None, user: dict = Depends(get_current_user)):
+    q = {"user_id": user["_id"]}
+    if game_id:
+        q["game_id"] = game_id
+    saves = await db.saves.find(q, {"_id": 0}).sort("created_at", -1).to_list(1000)
+    games_by_id = {g["id"]: g for g in await db.games.find({}, {"_id": 0}).to_list(1000)}
+    for s in saves:
+        g = games_by_id.get(s["game_id"])
+        if g:
+            s["game_title"] = g["title"]
+            s["game_cover"] = g["cover"]
+    return saves
+
+
+@api_router.post("/saves")
+async def create_save(payload: CreateSaveInput, user: dict = Depends(get_current_user)):
+    game = await db.games.find_one({"id": payload.game_id}, {"_id": 0})
+    if not game:
+        raise HTTPException(status_code=404, detail="Jogo não encontrado")
+    count = await db.saves.count_documents({"user_id": user["_id"], "game_id": payload.game_id})
+    doc = {"id": secrets.token_hex(8), "user_id": user["_id"], "game_id": payload.game_id,
+           "label": payload.label or f"Slot {count + 1}",
+           "size_mb": random.randint(8, 240),
+           "thumbnail": game["hero"],
+           "sync_status": "synced",
+           "session_id": payload.session_id,
+           "created_at": datetime.now(timezone.utc).isoformat()}
+    await db.saves.insert_one(doc)
+    return {k: v for k, v in doc.items() if k != "_id"}
+
+
+@api_router.delete("/saves/{save_id}")
+async def delete_save(save_id: str, user: dict = Depends(get_current_user)):
+    await db.saves.delete_one({"id": save_id, "user_id": user["_id"]})
+    return {"ok": True}
+
+
+@api_router.get("/stats")
+async def stats(user: dict = Depends(get_current_user)):
+    lib_count = await db.library.count_documents({"user_id": user["_id"]})
+    saves_count = await db.saves.count_documents({"user_id": user["_id"]})
+    items = await db.library.find({"user_id": user["_id"]}, {"_id": 0}).to_list(1000)
+    total_hours = round(sum(i.get("hours_played", 0) for i in items), 1)
+    return {"games_in_library": lib_count, "cloud_saves": saves_count,
+            "total_hours": total_hours, "plan": user.get("plan", "Free Trial")}
+
+
+# ----------------------------------------------------------------------------
+# Startup
+# ----------------------------------------------------------------------------
+@app.on_event("startup")
+async def startup():
+    await db.users.create_index("email", unique=True)
+    for n in NODES_SEED:
+        await db.nodes.update_one({"id": n["id"]}, {"$set": n}, upsert=True)
+    # seed admin
+    admin_email = os.environ.get("ADMIN_EMAIL", "admin@vortex.gg")
+    admin_password = os.environ.get("ADMIN_PASSWORD", "vortex123")
+    existing = await db.users.find_one({"email": admin_email})
+    if not existing:
+        await db.users.insert_one({"name": "Vortex Admin", "email": admin_email,
+                                   "password_hash": hash_password(admin_password), "role": "admin",
+                                   "plan": "Ultra Rig", "created_at": datetime.now(timezone.utc).isoformat()})
+    elif not verify_password(admin_password, existing["password_hash"]):
+        await db.users.update_one({"email": admin_email},
+                                  {"$set": {"password_hash": hash_password(admin_password)}})
+    cfg = await db.config.find_one({"id": "host"}) or {}
+    old_folders = cfg.get("game_folders") or []
+    async for g in db.mygames.find({"folder": {"$exists": False}}):
+        idx = g.get("folder_index", 0)
+        folder = old_folders[idx] if isinstance(idx, int) and 0 <= idx < min(2, len(old_folders)) else ""
+        await db.mygames.update_one({"_id": g["_id"]}, {"$set": {"folder": folder}, "$unset": {"folder_index": ""}})
+    logger.info("Vortex seed complete")
+
+
+# ----------------------------------------------------------------------------
+# WebRTC Signaling (real peer-to-peer screen stream demo)
+# ----------------------------------------------------------------------------
+class SignalRooms:
+    def __init__(self):
+        self.rooms: dict = {}
+
+    async def join(self, room: str, ws: WebSocket):
+        self.rooms.setdefault(room, set()).add(ws)
+
+    def leave(self, room: str, ws: WebSocket):
+        if room in self.rooms:
+            self.rooms[room].discard(ws)
+            if not self.rooms[room]:
+                self.rooms.pop(room, None)
+
+    async def broadcast(self, room: str, sender: WebSocket, message: str):
+        for peer in list(self.rooms.get(room, set())):
+            if peer is not sender:
+                try:
+                    await peer.send_text(message)
+                except Exception:
+                    pass
+
+    def count(self, room: str) -> int:
+        return len(self.rooms.get(room, set()))
+
+
+signal_rooms = SignalRooms()
+
+
+@api_router.websocket("/ws/signal/{room}")
+async def signal_ws(websocket: WebSocket, room: str):
+    await websocket.accept()
+    await signal_rooms.join(room, websocket)
+    # tell the newcomer how many peers are already here and notify others
+    await websocket.send_text(f'{{"type":"joined","peers":{signal_rooms.count(room)}}}')
+    await signal_rooms.broadcast(room, websocket, '{"type":"peer-joined"}')
+    try:
+        while True:
+            data = await websocket.receive_text()
+            await signal_rooms.broadcast(room, websocket, data)
+    except WebSocketDisconnect:
+        pass
+    finally:
+        signal_rooms.leave(room, websocket)
+        await signal_rooms.broadcast(room, websocket, '{"type":"peer-left"}')
+
+
+# ----------------------------------------------------------------------------
+# PC Host: my games, settings, ICE, authenticated stream signaling
+# ----------------------------------------------------------------------------
+import json
+import httpx
+from fastapi.responses import FileResponse
+
+AGENT_DIR = ROOT_DIR.parent / "host-agent"
+
+
+async def require_admin(user: dict = Depends(get_current_user)) -> dict:
+    if user.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Apenas o administrador pode fazer isso")
+    return user
+
+
+class KeyMap(BaseModel):
+    enabled: bool = False
+    buttons: dict = {}
+    lstick: str = "none"
+    rstick: str = "none"
+
+
+class MyGameInput(BaseModel):
+    title: str
+    folder: str = ""
+    exe: str
+    args: str = ""
+    cover: str = ""
+    hero: str = ""
+    genre: str = ""
+    key_map: Optional[KeyMap] = None
+
+
+class SettingsInput(BaseModel):
+    game_folders: List[str] = []
+    moonlight_host: str = ""
+    pc_name: str = "Meu PC"
+
+
+async def _settings_doc() -> dict:
+    s = await db.config.find_one({"id": "host"}, {"_id": 0}) or {}
+    return {"game_folders": [f for f in s.get("game_folders") or [] if f.strip()],
+            "moonlight_host": s.get("moonlight_host", ""), "pc_name": s.get("pc_name", "Meu PC")}
+
+
+@api_router.get("/settings")
+async def get_settings(user: dict = Depends(get_current_user)):
+    s = await _settings_doc()
+    if user.get("role") != "admin":
+        s["game_folders"] = []
+    return s
+
+
+@api_router.put("/settings")
+async def put_settings(payload: SettingsInput, user: dict = Depends(require_admin)):
+    data = payload.model_dump()
+    seen = []
+    for f in (x.strip() for x in data["game_folders"]):
+        if f and f not in seen:
+            seen.append(f)
+    data["game_folders"] = seen
+    await db.config.update_one({"id": "host"}, {"$set": {**data, "id": "host"}}, upsert=True)
+    return data
+
+
+@api_router.get("/mygames")
+async def list_mygames(user: dict = Depends(get_current_user)):
+    proj = {"_id": 0, "user_id": 0, "folder_index": 0}
+    if user.get("role") != "admin":
+        proj.update({"exe": 0, "args": 0, "folder": 0})
+    return await db.mygames.find({}, proj).sort("created_at", -1).to_list(1000)
+
+
+@api_router.get("/covers/search")
+async def covers_search(q: str, user: dict = Depends(require_admin)):
+    base = "https://cdn.cloudflare.steamstatic.com/steam/apps"
+    async with httpx.AsyncClient(timeout=8) as c:
+        r = await c.get("https://store.steampowered.com/api/storesearch/",
+                        params={"term": q, "l": "portuguese", "cc": "BR"})
+        out = []
+        for it in r.json().get("items", [])[:6]:
+            cover = f"{base}/{it['id']}/library_600x900.jpg"
+            if (await c.head(cover)).status_code != 200:
+                continue
+            hero = f"{base}/{it['id']}/library_hero.jpg"
+            if (await c.head(hero)).status_code != 200:
+                hero = f"{base}/{it['id']}/header.jpg"
+            out.append({"appid": it["id"], "name": it["name"], "cover": cover, "hero": hero})
+    return out
+
+
+@api_router.post("/mygames")
+async def create_mygame(payload: MyGameInput, user: dict = Depends(require_admin)):
+    if not payload.title.strip() or not payload.exe.strip():
+        raise HTTPException(status_code=400, detail="Nome e executável são obrigatórios")
+    doc = {**payload.model_dump(), "id": secrets.token_hex(6), "user_id": user["_id"],
+           "created_at": datetime.now(timezone.utc).isoformat()}
+    await db.mygames.insert_one(doc)
+    return {k: v for k, v in doc.items() if k not in ("_id", "user_id")}
+
+
+@api_router.put("/mygames/{game_id}")
+async def update_mygame(game_id: str, payload: MyGameInput, user: dict = Depends(require_admin)):
+    res = await db.mygames.update_one({"id": game_id}, {"$set": payload.model_dump()})
+    if not res.matched_count:
+        raise HTTPException(status_code=404, detail="Jogo não encontrado")
+    return await db.mygames.find_one({"id": game_id}, {"_id": 0, "user_id": 0})
+
+
+@api_router.delete("/mygames/{game_id}")
+async def delete_mygame(game_id: str, user: dict = Depends(require_admin)):
+    await db.mygames.delete_one({"id": game_id})
+    return {"ok": True}
+
+
+def _join_path(folder: str, exe: str) -> str:
+    if not folder or ":" in exe[:3] or exe.startswith(("\\\\", "/")):
+        return exe
+    sep = "\\" if "\\" in folder or ":" in folder[:3] else "/"
+    return folder.rstrip("\\/") + sep + exe.lstrip("\\/")
+
+
+@api_router.get("/mygames/sunshine/export")
+async def sunshine_export(user: dict = Depends(require_admin)):
+    games = await db.mygames.find({}, {"_id": 0}).to_list(1000)
+    apps = []
+    for g in games:
+        full = _join_path(g.get("folder", ""), g["exe"])
+        wd = full.rsplit("\\", 1)[0] if "\\" in full else full.rsplit("/", 1)[0]
+        cmd = f'"{full}" {g.get("args", "")}'.strip()
+        apps.append({"name": g["title"], "cmd": cmd, "working-dir": wd, "auto-detach": "true",
+                     "cover": g.get("cover", "")})
+    return {"apps": apps}
+
+
+@api_router.get("/webrtc/ice")
+async def ice_servers(user: dict = Depends(get_current_user)):
+    servers = [{"urls": ["stun:stun.l.google.com:19302", "stun:stun1.l.google.com:19302"]}]
+    urls = os.environ.get("TURN_URLS")
+    if urls:
+        servers.append({"urls": urls.split(","), "username": os.environ.get("TURN_USERNAME", ""),
+                        "credential": os.environ.get("TURN_CREDENTIAL", "")})
+        return {"iceServers": servers, "turn": "custom"}
+    try:
+        async with httpx.AsyncClient(timeout=6) as c:
+            r = await c.post(f"https://turn.elixir-webrtc.org/?service=turn&username=vx{user['_id'][-6:]}")
+            d = r.json()
+        uris = d["uris"] + [u.replace("udp", "tcp") for u in d["uris"] if "udp" in u]
+        servers.append({"urls": uris, "username": d["username"], "credential": d["password"]})
+        return {"iceServers": servers, "turn": "free-test"}
+    except Exception as e:
+        logger.warning(f"TURN fetch failed: {e}")
+        return {"iceServers": servers, "turn": "none"}
+
+
+def _bat(v: str) -> str:
+    return (v or "").replace("%", "%%").replace('"', "")
+
+
+@api_router.get("/host/agent/iniciar_agente.bat")
+async def download_agent_bat(site: str, user: dict = Depends(require_admin)):
+    if not site.startswith(("https://", "http://")):
+        raise HTTPException(status_code=400, detail="Site inválido")
+    pwd = os.environ.get("ADMIN_PASSWORD", "") if user["email"] == os.environ.get("ADMIN_EMAIL") else ""
+    lines = [
+        "@echo off", "chcp 65001 >nul",
+        "REM Roda como administrador: necessario para jogos que exigem elevacao e para os controles funcionarem neles",
+        "net session >nul 2>&1",
+        "if %errorlevel% neq 0 (",
+        "  powershell -NoProfile -Command \"Start-Process -FilePath '%~f0' -Verb RunAs\"",
+        "  exit /b",
+        ")",
+        "REM Vortex - agente do PC (gerado pelo site). Nao compartilhe este arquivo.",
+        f'set "VORTEX_SITE={_bat(site.rstrip("/"))}"',
+        f'set "VORTEX_EMAIL={_bat(user["email"])}"',
+        f'set "VORTEX_PASS={_bat(pwd)}"',
+        "REM Usuario e senha da interface web do Sunshine (https://localhost:47990)",
+        f'set "SUNSHINE_USER={_bat(os.environ.get("SUNSHINE_USER", ""))}"',
+        f'set "SUNSHINE_PASS={_bat(os.environ.get("SUNSHINE_PASS", ""))}"',
+        "REM janela = transmite SO a janela do jogo (recomendado) | tela = tela inteira",
+        'set "VORTEX_CAPTURA=janela"',
+        "REM Opcional: dispositivo de audio a transmitir (ex.: Mixagem estereo)",
+        'set "VORTEX_AUDIO="',
+        "REM Segundos sem ninguem jogando ate fechar o jogo no PC",
+        'set "VORTEX_FECHAR_APOS=60"',
+        'cd /d "%~dp0"',
+        "python -m pip install --disable-pip-version-check -q websockets pillow vgamepad",
+        "python vortex_agent.py",
+        "pause", "",
+    ]
+    return Response("\r\n".join(lines), media_type="application/octet-stream",
+                    headers={"Content-Disposition": 'attachment; filename="iniciar_agente.bat"'})
+
+
+@api_router.get("/host/agent/{name}")
+async def download_agent(name: str):
+    allowed = {"vortex_agent.py", "requirements.txt"}
+    if name not in allowed:
+        raise HTTPException(status_code=404, detail="Arquivo não encontrado")
+    return FileResponse(AGENT_DIR / name, filename=name)
+
+
+class StreamStats(BaseModel):
+    fps: float = 0
+    rtt: float = 0
+    mbps: float = 0
+    res: str = ""
+
+
+class StreamStart(BaseModel):
+    game_id: Optional[str] = None
+
+
+@api_router.post("/streams/start")
+async def stream_start(payload: StreamStart, user: dict = Depends(get_current_user)):
+    game = await db.mygames.find_one({"id": payload.game_id}, {"_id": 0}) if payload.game_id else None
+    now = datetime.now(timezone.utc).isoformat()
+    doc = {"id": secrets.token_hex(8), "user_id": user["_id"], "user_name": user.get("name"),
+           "game_id": payload.game_id, "game_title": game["title"] if game else "Área de trabalho",
+           "game_cover": game.get("cover", "") if game else "", "started_at": now, "last_seen": now,
+           "samples": 0, "fps_sum": 0, "rtt_sum": 0, "mbps_sum": 0, "res": "", "active": True}
+    await db.streams.insert_one(doc)
+    return {"id": doc["id"]}
+
+
+@api_router.post("/streams/{sid}/stats")
+async def stream_stats(sid: str, payload: StreamStats, user: dict = Depends(get_current_user)):
+    await db.streams.update_one({"id": sid, "user_id": user["_id"]}, {
+        "$inc": {"samples": 1, "fps_sum": payload.fps, "rtt_sum": payload.rtt, "mbps_sum": payload.mbps},
+        "$set": {"last_seen": datetime.now(timezone.utc).isoformat(), "res": payload.res}})
+    return {"ok": True}
+
+
+@api_router.post("/streams/{sid}/end")
+async def stream_end(sid: str, user: dict = Depends(get_current_user)):
+    await db.streams.update_one({"id": sid, "user_id": user["_id"]},
+                                {"$set": {"active": False, "last_seen": datetime.now(timezone.utc).isoformat()}})
+    return {"ok": True}
+
+
+@api_router.get("/streams/history")
+async def stream_history(user: dict = Depends(get_current_user)):
+    q = {} if user.get("role") == "admin" else {"user_id": user["_id"]}
+    docs = await db.streams.find(q, {"_id": 0}).sort("started_at", -1).to_list(300)
+    stale = datetime.now(timezone.utc) - timedelta(seconds=60)
+    out = []
+    for d in docs:
+        n = d.get("samples") or 0
+        last = datetime.fromisoformat(d["last_seen"])
+        out.append({"id": d["id"], "user_name": d.get("user_name"), "game_title": d["game_title"],
+                    "game_cover": d.get("game_cover"), "started_at": d["started_at"],
+                    "duration_seconds": int((last - datetime.fromisoformat(d["started_at"])).total_seconds()),
+                    "active": bool(d.get("active")) and last > stale, "res": d.get("res"),
+                    "avg_fps": round(d["fps_sum"] / n) if n else 0, "avg_rtt": round(d["rtt_sum"] / n) if n else 0,
+                    "avg_mbps": round(d["mbps_sum"] / n, 1) if n else 0})
+    return out
+
+
+class StreamRooms:
+    def __init__(self):
+        self.rooms: dict = {}
+
+    def room(self, uid: str) -> dict:
+        return self.rooms.setdefault(uid, {"host": None, "agent": None, "viewers": {}})
+
+
+stream_rooms = StreamRooms()
+
+
+HOST_ROOM = "main"
+
+
+async def _ws_user(token: str) -> Optional[dict]:
+    try:
+        payload = jwt.decode(token, get_jwt_secret(), algorithms=[JWT_ALGORITHM])
+        return await db.users.find_one({"_id": ObjectId(payload["sub"])})
+    except Exception:
+        return None
+
+
+async def _send(ws: Optional[WebSocket], obj: dict):
+    if ws:
+        try:
+            await ws.send_text(json.dumps(obj))
+        except Exception:
+            pass
+
+
+async def _broadcast(room: dict, obj: dict):
+    for vws in list(room["viewers"].values()):
+        await _send(vws, obj)
+
+
+@api_router.get("/host/status")
+async def host_status(user: dict = Depends(get_current_user)):
+    r = stream_rooms.room(HOST_ROOM)
+    return {"online": r["host"] is not None or r["agent"] is not None, "streaming": r["host"] is not None,
+            "agent": r["agent"] is not None, "viewers": len(r["viewers"])}
+
+
+async def _viewer_launch(room: dict, peer_id: str, game_id: str):
+    viewer = room["viewers"].get(peer_id)
+    if not room["agent"] and room["host"]:
+        await _send(room["host"], {"type": "launch", "game_id": game_id, "from": peer_id})
+        return
+    if not room["agent"]:
+        await _send(viewer, {"type": "status", "state": "offline", "text": "O PC está desligado ou o agente não está rodando."})
+        return
+    game = await db.mygames.find_one({"id": game_id}, {"_id": 0})
+    if not game:
+        await _send(viewer, {"type": "status", "state": "error", "text": "Jogo não encontrado."})
+        return
+    await _send(room["agent"], {"type": "launch", "game_id": game_id, "title": game["title"],
+                                "path": _join_path(game.get("folder", ""), game["exe"]), "args": game.get("args", "")})
+
+
+@api_router.websocket("/ws/stream")
+async def stream_ws(websocket: WebSocket, token: str = "", role: str = "viewer", pid: str = ""):
+    user = await _ws_user(token)
+    await websocket.accept()
+    if not user or role not in ("host", "viewer", "agent") or (role != "viewer" and user.get("role") != "admin"):
+        await websocket.close(code=4401)
+        return
+    room = stream_rooms.room(HOST_ROOM)
+    peer_id = pid[:16] if role == "viewer" and pid.isalnum() else secrets.token_hex(4)
+    if role in ("host", "agent"):
+        if room[role]:
+            await _send(room[role], {"type": "replaced"})
+            try:
+                await room[role].close()
+            except Exception:
+                pass
+        room[role] = websocket
+        await _send(websocket, {"type": "welcome", "id": peer_id, "viewers": list(room["viewers"].keys())})
+        await _broadcast(room, {"type": f"{role}-online"})
+    else:
+        old = room["viewers"].get(peer_id)
+        room["viewers"][peer_id] = websocket
+        if old:
+            try:
+                await old.close()
+            except Exception:
+                pass
+        await _send(websocket, {"type": "welcome", "id": peer_id, "host": room["host"] is not None,
+                                "agent": room["agent"] is not None})
+        await _send(room["host"], {"type": "viewer-joined", "id": peer_id})
+        await _send(room["agent"], {"type": "viewer-joined"})
+    try:
+        while True:
+            msg = json.loads(await websocket.receive_text())
+            kind = msg.get("type")
+            if kind == "ping":
+                await _send(websocket, {"type": "pong"})
+            elif role == "host":
+                await _send(room["viewers"].get(msg.get("to")), {**msg, "from": "host"})
+            elif role == "agent":
+                if kind == "status":
+                    await _broadcast(room, msg)
+            elif kind == "launch":
+                await _viewer_launch(room, peer_id, msg.get("game_id"))
+            elif kind == "quit":
+                await _send(room["agent"], {"type": "quit"})
+                await _send(room["host"], {"type": "quit", "from": peer_id})
+            else:
+                await _send(room["host"], {**msg, "from": peer_id})
+    except (WebSocketDisconnect, json.JSONDecodeError, RuntimeError):
+        pass
+    finally:
+        if role in ("host", "agent") and room[role] is websocket:
+            room[role] = None
+            await _broadcast(room, {"type": f"{role}-offline"})
+        elif role == "viewer" and room["viewers"].get(peer_id) is websocket:
+            room["viewers"].pop(peer_id, None)
+            await _send(room["host"], {"type": "viewer-left", "id": peer_id})
+            if not room["viewers"]:
+                await _send(room["agent"], {"type": "viewers-empty"})
+
+
+app.include_router(api_router)
+app.add_middleware(
+    CORSMiddleware,
+    allow_credentials=True,
+    allow_origins=[] if os.environ['CORS_ORIGINS'] == '*' else os.environ['CORS_ORIGINS'].split(','),
+    allow_origin_regex='.*' if os.environ['CORS_ORIGINS'] == '*' else None,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+@app.on_event("shutdown")
+async def shutdown():
+    client.close()
