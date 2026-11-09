@@ -79,3 +79,5 @@ Usuário (PT-BR) quer um "cloud gaming" com servidor próprio para jogar jogos d
 ## Sessão 2026-06 (parte 7)
 - Clonado de frots138-sudo/vortex1.2; .env com novo JWT_SECRET gerado, admin e Sunshine.
 - Corrigido CORS: com CORS_ORIGINS="*" e credenciais, usa allow_origin_regex (login falhava no navegador).
+- Controles mortos: Chrome 147+ (Local Network Access) bloqueava ws://127.0.0.1 no Chrome dedicado. Agente agora abre o Chrome com LNA desativado; Host reconecta ao agente sozinho a cada 2s.
+- Latência na mesma rede: mDNS escondia o IP local e forçava TURN externo; Chrome dedicado agora expõe IP local (P2P direto na LAN) + prioridade alta no vídeo.

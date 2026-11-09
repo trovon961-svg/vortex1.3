@@ -40,21 +40,32 @@ export default function useHostEngine() {
   };
   const toViewers = (msg) => peers.current.forEach((p) => p.dc?.readyState === "open" && p.dc.send(JSON.stringify(msg)));
 
+  const agentPin = useRef(null);
+  const agentRetry = useRef(null);
+  const agentOk = useRef(false);
+
   const connectAgent = useCallback((pin) => {
-    try { agentWs.current?.close(); } catch { /* noop */ }
-    setAgent({ state: "connecting" });
+    clearTimeout(agentRetry.current);
+    agentPin.current = pin;
+    const old = agentWs.current;
+    agentWs.current = null;
+    try { old?.close(); } catch { /* noop */ }
+    setAgent((a) => (a.state === "ok" ? a : { state: "connecting" }));
+    let opened = false;
+    let bad = false;
     const ws = new WebSocket(AGENT_URL);
     agentWs.current = ws;
-    ws.onopen = () => ws.send(JSON.stringify({ pin }));
+    ws.onopen = () => { opened = true; ws.send(JSON.stringify({ pin })); };
     ws.onmessage = (ev) => {
       const m = JSON.parse(ev.data);
       if (m.t === "auth") {
         if (m.ok) {
           localStorage.setItem("vx_agent_pin", pin);
+          agentOk.current = true;
           setAgent({ state: "ok", gamepad: m.gamepad, platform: m.platform, sunshine: m.sunshine });
           note("Agente local conectado");
           toViewers({ t: "agent", ok: true });
-        } else setAgent({ state: "badpin" });
+        } else { bad = true; agentPin.current = null; setAgent({ state: "badpin" }); }
       } else if (m.t === "sunshine-result") {
         if (m.ok) { toast.success(`Sunshine sincronizado: ${m.added} novo(s), ${m.updated} atualizado(s)`); note("Sunshine sincronizado"); }
         else toast.error(m.error);
@@ -63,7 +74,14 @@ export default function useHostEngine() {
         toViewers(m);
       }
     };
-    ws.onclose = () => setAgent((a) => (a.state === "badpin" ? a : { state: "off" }));
+    ws.onclose = () => {
+      if (agentWs.current !== ws) return;
+      if (bad) return;
+      if (!opened) note("Sem acesso ao agente: confira se ele está aberto e permita \"Acesso à rede local\" no cadeado do Chrome");
+      setAgent({ state: "off" });
+      if (agentOk.current) { agentOk.current = false; toViewers({ t: "agent", ok: false }); }
+      if (agentPin.current) agentRetry.current = setTimeout(() => agentPin.current && connectAgent(agentPin.current), 2000);
+    };
   }, [note]);
 
   const syncSunshine = useCallback(async () => {
@@ -226,7 +244,12 @@ export default function useHostEngine() {
     return () => clearInterval(t);
   }, []);
 
-  useEffect(() => () => { stopCapture(); try { agentWs.current?.close(); } catch { /* noop */ } }, [stopCapture]);
+  useEffect(() => () => {
+    stopCapture();
+    agentPin.current = null;
+    clearTimeout(agentRetry.current);
+    try { agentWs.current?.close(); } catch { /* noop */ }
+  }, [stopCapture]);
 
   return { agent, capturing, signal, viewers, turn, log, previewRef, stream, connectAgent, startCapture, stopCapture, syncSunshine };
 }

@@ -448,7 +448,10 @@ class Session:
             "--lang=en-US", f"--auto-select-desktop-capture-source={source}", "--use-fake-ui-for-media-stream",
             "--autoplay-policy=no-user-gesture-required", "--disable-background-timer-throttling",
             "--disable-renderer-backgrounding", "--disable-backgrounding-occluded-windows",
-            "--disable-features=CalculateNativeWinOcclusion",
+            # LNA: libera ws://127.0.0.1 (controles) sem prompt; mDNS off: conexão direta na rede local (baixa latência)
+            "--disable-features=CalculateNativeWinOcclusion,LocalNetworkAccessChecks,LocalNetworkAccessChecksWebSockets,"
+            "LocalNetworkAccessChecksWebRTC,WebRtcHideLocalIpsWithMdns,BlockInsecurePrivateNetworkRequests,"
+            "PrivateNetworkAccessSendPreflights,PrivateNetworkAccessRespectPreflightResults",
             "--no-first-run", "--no-default-browser-check", "--window-size=420,300", "--window-position=0,0",
         ])
         for _ in range(5):  # garante o jogo na frente da janelinha do Chrome

@@ -78,6 +78,8 @@ export async function applyQuality(sender, preset) {
   p.encodings[0].maxBitrate = q.bitrate;
   p.encodings[0].maxFramerate = 60;
   p.encodings[0].scaleResolutionDownBy = q.scale;
+  p.encodings[0].priority = "high";
+  p.encodings[0].networkPriority = "high";
   p.degradationPreference = "maintain-framerate";
   try { await sender.setParameters(p); } catch { /* unsupported param on this browser */ }
 }
